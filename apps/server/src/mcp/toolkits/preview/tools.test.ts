@@ -1,5 +1,5 @@
 import { expect, it } from "@effect/vitest";
-import { Tool } from "effect/unstable/ai";
+import { Tool } from "effect/ai";
 
 import { PreviewToolkit } from "./tools.ts";
 
@@ -10,6 +10,19 @@ const schemaHasDescription = (schema: unknown): boolean => {
   return [record.anyOf, record.oneOf, record.allOf]
     .filter(Array.isArray)
     .some((members) => members.some(schemaHasDescription));
+};
+
+const schemaHasMultipleAllOfDescriptions = (schema: unknown): boolean => {
+  if (!schema || typeof schema !== "object") return false;
+  const record = schema as Record<string, unknown>;
+  const allOf = Array.isArray(record.allOf) ? record.allOf : [];
+  const descriptionCount = allOf.filter(
+    (member) =>
+      member !== null &&
+      typeof member === "object" &&
+      typeof (member as Record<string, unknown>).description === "string",
+  ).length;
+  return descriptionCount > 1 || Object.values(record).some(schemaHasMultipleAllOfDescriptions);
 };
 
 it("exports provider-compatible object schemas with described parameters", () => {
@@ -27,6 +40,9 @@ it("exports provider-compatible object schemas with described parameters", () =>
     expect(schema.type, `${tool.name} must export a top-level object schema`).toBe("object");
     expect(schema.anyOf, `${tool.name} must not export a root anyOf`).toBeUndefined();
     expect(schema.oneOf, `${tool.name} must not export a root oneOf`).toBeUndefined();
+    if (tool.name === "preview_navigate") {
+      expect(schemaHasMultipleAllOfDescriptions(schema)).toBe(false);
+    }
     expect(
       schema.properties?.tabId,
       `${tool.name} must allow an explicit collaborative browser tab target`,

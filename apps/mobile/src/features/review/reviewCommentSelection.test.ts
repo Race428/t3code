@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
-  countReviewCommentContexts,
   formatReviewCommentContext,
   parseReviewCommentMessageSegments,
   parseReviewInlineComments,
@@ -43,20 +42,21 @@ function makeTarget(): ReviewCommentTarget {
 }
 
 describe("review comment serialization", () => {
-  it("preserves enough metadata for inline diff rendering", () => {
-    const serialized = formatReviewCommentContext(makeTarget(), "Please keep this configurable.");
+  it("keeps closing-tag text inside a chip label within a real review body", () => {
+    const body = "Before [</review_comment>](t3-context://v1/mention/context-1) after";
+    const serialized = `<review_comment sectionId="s" filePath="app.ts" startIndex="0" endIndex="0">${body}</review_comment>`;
+    const segments = parseReviewCommentMessageSegments(`${serialized} tail`);
+    expect(segments).toEqual([
+      { kind: "review-comment", comment: expect.objectContaining({ text: body }) },
+      { kind: "text", id: `review-comment-text:${serialized.length}`, text: " tail" },
+    ]);
+  });
 
-    expect(countReviewCommentContexts(serialized)).toBe(1);
-    expect(parseReviewInlineComments(serialized)).toEqual([
-      expect.objectContaining({
-        sectionId: "section-1",
-        sectionTitle: "Working tree",
-        filePath: "apps/demo/src/main.ts",
-        startIndex: 0,
-        endIndex: 1,
-        text: "Please keep this configurable.",
-        diff: expect.stringContaining("-const retryLimit = 2;"),
-      }),
+  it("treats legacy markup inside a context label as opaque text", () => {
+    const text =
+      '[<review_comment sectionId="s" filePath="app.ts" startIndex="0" endIndex="0">Review this</review_comment>](t3-context://v1/mention/context-1)';
+    expect(parseReviewCommentMessageSegments(text)).toEqual([
+      { kind: "text", id: "review-comment-text:0", text },
     ]);
   });
 

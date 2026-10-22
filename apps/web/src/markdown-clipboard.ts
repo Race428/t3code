@@ -1,11 +1,3 @@
-/**
- * Converts a DOM selection inside rendered chat markdown back into markdown
- * source so highlight-and-copy keeps formatting (links, emphasis, lists,
- * fences, tables) instead of flattening to plain text. The `text/plain`
- * clipboard flavor carries the markdown; `text/html` carries a sanitized
- * copy of the rendered fragment for rich-paste targets.
- */
-
 const SKIPPED_TAGS = new Set(["BUTTON", "INPUT", "SCRIPT", "STYLE", "TEMPLATE"]);
 const SKIPPED_CLASS_NAMES = ["select-none", "sr-only"];
 const SANITIZED_HTML_SELECTOR = [
@@ -29,12 +21,25 @@ function isSkippedElement(element: Element): boolean {
   return SKIPPED_CLASS_NAMES.some((className) => element.classList.contains(className));
 }
 
-/** Hoists surrounding whitespace outside the markers: "` bold `" → " **bold** ". */
 function wrapInlineMarker(content: string, marker: string): string {
   const match = /^(\s*)([\s\S]*?)(\s*)$/.exec(content);
   const core = match?.[2] ?? "";
   if (!core) return content;
   return `${match?.[1] ?? ""}${marker}${core}${marker}${match?.[3] ?? ""}`;
+}
+
+/**
+ * A code element whose pre wrapper fell outside the copied range is still block
+ * code, recognizable by its highlighter line spans or embedded newlines.
+ */
+function isBlockCodeElement(element: Element, content: string): boolean {
+  if (content.includes("\n")) return true;
+  for (const child of element.childNodes) {
+    if (child.nodeType === Node.ELEMENT_NODE && (child as Element).classList.contains("line")) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function wrapInlineCode(code: string): string {
@@ -63,10 +68,14 @@ function resolveCodeBlockLanguage(pre: Element): string | null {
   return declared && declared !== "text" ? declared : null;
 }
 
-function serializeCodeBlock(pre: Element): string {
-  const code = (pre.textContent ?? "").replace(/\n$/, "");
+export function serializeCodeBlockToMarkdown(source: string, language: string | null): string {
+  const code = source.replace(/\n$/, "");
   const fence = codeFenceFor(code);
-  return `${fence}${resolveCodeBlockLanguage(pre) ?? ""}\n${code}\n${fence}\n\n`;
+  return `${fence}${language ?? ""}\n${code}\n${fence}\n\n`;
+}
+
+function serializeCodeBlock(pre: Element): string {
+  return serializeCodeBlockToMarkdown(pre.textContent ?? "", resolveCodeBlockLanguage(pre));
 }
 
 function serializeTableCell(cell: Element): string {
@@ -103,17 +112,21 @@ function serializeTable(table: Element): string {
 }
 
 function serializeListItem(item: Element, ordered: boolean, index: number): string {
-  const checkbox = item.querySelector('input[type="checkbox"]');
+  const checkbox = item.querySelector(
+    ':scope > input[type="checkbox"], :scope > p > input[type="checkbox"]',
+  );
   const task = checkbox ? `[${(checkbox as HTMLInputElement).checked ? "x" : " "}] ` : "";
-  const marker = ordered ? `${index}. ${task}` : `- ${task}`;
+  const bullet = ordered ? `${index}. ` : "- ";
+  const marker = `${bullet}${task}`;
   let content = serializeChildren(item)
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-  // Tight list items (no paragraph children) keep nested lists on adjacent lines.
   if (!item.querySelector(":scope > p")) {
     content = content.replace(/\n{2,}/g, "\n");
   }
-  const continuationIndent = " ".repeat(marker.length);
+  // Nested content lines up with the item text, which starts after the bullet;
+  // a task box is part of that text, not of the list marker.
+  const continuationIndent = " ".repeat(bullet.length);
   const [first = "", ...rest] = content.split("\n");
   return [
     `${marker}${first}`,
@@ -173,8 +186,6 @@ function serializeChildren(node: Node): string {
 function serializeNode(node: Node): string {
   if (node.nodeType === Node.TEXT_NODE) {
     const text = node.textContent ?? "";
-    // Inter-block formatting whitespace from the renderer collapses to a
-    // newline; real inline whitespace passes through untouched.
     if (text.includes("\n") && text.trim().length === 0) return "\n";
     return text;
   }
@@ -201,8 +212,10 @@ function serializeNode(node: Node): string {
       return `${serializeChildren(element).trim()}\n\n`;
     case "PRE":
       return serializeCodeBlock(element);
-    case "CODE":
-      return wrapInlineCode(element.textContent ?? "");
+    case "CODE": {
+      const content = element.textContent ?? "";
+      return isBlockCodeElement(element, content) ? content : wrapInlineCode(content);
+    }
     case "STRONG":
     case "B":
       return wrapInlineMarker(serializeChildren(element), "**");
@@ -238,7 +251,63 @@ function serializeNode(node: Node): string {
   }
 }
 
-/** Collapses serializer spacing artifacts without touching fenced code content. */
+interface SoleCodeBlockScan {
+  pre: Element | null;
+  other: boolean;
+}
+
+function scanForSoleCodeBlock(node: Node, scan: SoleCodeBlockScan): void {
+  for (const child of node.childNodes) {
+    if (scan.other) return;
+    if (child.nodeType === Node.TEXT_NODE) {
+      if ((child.textContent ?? "").trim().length > 0) scan.other = true;
+      continue;
+    }
+    if (child.nodeType !== Node.ELEMENT_NODE) continue;
+    const element = child as Element;
+    // Mirrors serializeNode's order: an element carrying markdown of its own
+    // still contributes it even when its tag is otherwise skipped, as a file
+    // chip rendered as a button does.
+    if (element.hasAttribute("data-markdown-details")) {
+      scan.other = true;
+      continue;
+    }
+    const markdownCopy = element.getAttribute("data-markdown-copy");
+    if (markdownCopy !== null) {
+      if (markdownCopy.trim().length > 0) scan.other = true;
+      continue;
+    }
+    if (isSkippedElement(element)) continue;
+    if (element.tagName === "PRE") {
+      if (scan.pre) scan.other = true;
+      else scan.pre = element;
+      continue;
+    }
+    if (element.tagName === "IMG" || element.tagName === "HR") {
+      scan.other = true;
+      continue;
+    }
+    if (element.tagName === "LI") {
+      const preBeforeItem = scan.pre;
+      scanForSoleCodeBlock(element, scan);
+      if (!scan.other && scan.pre === preBeforeItem) scan.other = true;
+      continue;
+    }
+    scanForSoleCodeBlock(element, scan);
+  }
+}
+
+/**
+ * A drag that ends on a block's final newline pulls the closing `pre` into the
+ * range, so the fragment holds the whole block even though the user only
+ * highlighted code.
+ */
+function soleCodeBlock(container: Node): Element | null {
+  const scan: SoleCodeBlockScan = { pre: null, other: false };
+  scanForSoleCodeBlock(container, scan);
+  return scan.other ? null : scan.pre;
+}
+
 function tidyMarkdown(markdown: string): string {
   return markdown
     .split(/(```[\s\S]*?(?:```|$))/)
@@ -250,11 +319,31 @@ function tidyMarkdown(markdown: string): string {
 }
 
 export function serializeRenderedMarkdownFragment(container: Node): string {
+  const codeBlock = soleCodeBlock(container);
+  if (codeBlock) return (codeBlock.textContent ?? "").replace(/\n$/, "");
   return tidyMarkdown(serializeChildren(container));
 }
 
 export function serializeTableElementToMarkdown(table: Element): string {
   return serializeTable(table).trim();
+}
+
+// The wrapper MarkdownMath puts on every formula it renders. The sanitizer drops
+// the attribute from authored HTML.
+const MATH_SELECTOR = "[data-markdown-math]";
+
+export function mathWrapperOf(element: Element | null): Element | null {
+  return element?.closest(MATH_SELECTOR) ?? null;
+}
+
+/** A cell's text, with each formula as its TeX. */
+function csvCellText(cell: Element): string {
+  if (!cell.querySelector(MATH_SELECTOR)) return cell.textContent ?? "";
+  const copy = cell.cloneNode(true) as Element;
+  for (const wrapper of copy.querySelectorAll(MATH_SELECTOR)) {
+    wrapper.replaceWith(wrapper.getAttribute("data-markdown-copy")?.trim() ?? "");
+  }
+  return copy.textContent ?? "";
 }
 
 function csvCell(value: string): string {
@@ -270,12 +359,36 @@ export function serializeTableElementToCsv(table: Element): string {
       (cell) => cell.tagName === "TH" || cell.tagName === "TD",
     );
     if (cells.length === 0) continue;
-    lines.push(cells.map((cell) => csvCell(cell.textContent ?? "")).join(","));
+    lines.push(cells.map((cell) => csvCell(csvCellText(cell))).join(","));
   }
   return lines.join("\n");
 }
 
+function mermaidSourceHtml(source: string) {
+  const pre = document.createElement("pre");
+  const code = document.createElement("code");
+  code.textContent = source.trim();
+  pre.appendChild(code);
+  return pre;
+}
+
+function mathSourceElement(wrapper: Element): Element {
+  const code = document.createElement("code");
+  code.textContent = wrapper.getAttribute("data-markdown-copy")?.trim() ?? "";
+  if (wrapper.getAttribute("data-markdown-math") !== "display") return code;
+  const pre = document.createElement("pre");
+  pre.append(code);
+  return pre;
+}
+
 function sanitizedHtmlFrom(container: Element): string {
+  for (const diagram of container.querySelectorAll("[data-markdown-mermaid]")) {
+    const source = diagram.getAttribute("data-markdown-copy");
+    if (source !== null) diagram.replaceChildren(mermaidSourceHtml(source));
+  }
+  for (const wrapper of container.querySelectorAll(MATH_SELECTOR)) {
+    wrapper.replaceWith(mathSourceElement(wrapper));
+  }
   for (const node of container.querySelectorAll(SANITIZED_HTML_SELECTOR)) {
     if (
       node.classList.contains("chat-markdown-file-link") ||
@@ -301,6 +414,35 @@ export function chatMarkdownClipboardPayload(
     if (range.collapsed) continue;
     const container = document.createElement("div");
     container.appendChild(range.cloneContents());
+    const ancestor = range.commonAncestorContainer;
+    const ancestorElement =
+      ancestor.nodeType === Node.ELEMENT_NODE ? (ancestor as Element) : ancestor.parentElement;
+    const diagramSource = ancestorElement
+      ?.closest("[data-markdown-mermaid]")
+      ?.getAttribute("data-markdown-copy");
+    if (diagramSource != null) {
+      const text = diagramSource.trim();
+      if (!text) continue;
+      texts.push(text);
+      container.replaceChildren(mermaidSourceHtml(diagramSource));
+      htmls.push(sanitizedHtmlFrom(container));
+      continue;
+    }
+    // A range inside a formula would clone only KaTeX's glyphs, not the wrapper holding the TeX.
+    const math = mathWrapperOf(ancestorElement);
+    if (math) {
+      texts.push(math.getAttribute("data-markdown-copy")?.trim() ?? "");
+      htmls.push(`<meta charset="utf-8">${mathSourceElement(math).outerHTML}`);
+      continue;
+    }
+    if (ancestorElement?.closest("pre")) {
+      const text = range.toString();
+      if (text) {
+        texts.push(text);
+        htmls.push(sanitizedHtmlFrom(container));
+      }
+      continue;
+    }
     const text = serializeRenderedMarkdownFragment(container);
     if (!text) continue;
     texts.push(text);

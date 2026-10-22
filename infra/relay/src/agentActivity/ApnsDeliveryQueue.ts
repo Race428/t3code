@@ -25,7 +25,7 @@ import {
 } from "./apnsDeliveryJobs.ts";
 import * as RelayConfiguration from "../Config.ts";
 
-export class ApnsDeliveryQueueSendError extends Schema.TaggedErrorClass<ApnsDeliveryQueueSendError>()(
+export class ApnsDeliveryQueueSendError extends Schema.TaggedError<ApnsDeliveryQueueSendError>()(
   "ApnsDeliveryQueueSendError",
   {
     operation: Schema.Literals(["generate-job-id", "send"]),
@@ -46,7 +46,9 @@ export type ApnsDeliveryQueueError = ApnsDeliveryQueueSendError;
 export class ApnsDeliveryQueueSender extends Context.Service<
   ApnsDeliveryQueueSender,
   {
-    readonly send: (body: SignedApnsDeliveryJob) => Effect.Effect<void, Cloudflare.QueueSendError>;
+    readonly send: (
+      body: SignedApnsDeliveryJob,
+    ) => Effect.Effect<void, Cloudflare.Queues.SendError>;
   }
 >()("t3code-relay/agentActivity/ApnsDeliveryQueue/ApnsDeliveryQueueSender") {}
 
@@ -87,7 +89,7 @@ export const make = Effect.gen(function* () {
           "relay.delivery.kind": input.kind,
         });
         const now = yield* DateTime.now;
-        const jobId = yield* crypto.randomUUIDv4.pipe(
+        const jobId = yield* crypto.randomUUIDv4().pipe(
           Effect.mapError(
             (cause) =>
               new ApnsDeliveryQueueSendError({
@@ -146,7 +148,7 @@ export const make = Effect.gen(function* () {
           "relay.thread_id": input.notification.threadId,
         });
         const now = yield* DateTime.now;
-        const jobId = yield* crypto.randomUUIDv4.pipe(
+        const jobId = yield* crypto.randomUUIDv4().pipe(
           Effect.mapError(
             (cause) =>
               new ApnsDeliveryQueueSendError({
@@ -207,7 +209,7 @@ export const make = Effect.gen(function* () {
 export const layer = Layer.effect(ApnsDeliveryQueue, make);
 
 export const layerCloudflareQueues = (
-  sender: Cloudflare.QueueSender,
+  sender: Cloudflare.Queues.WriteQueueClient,
   alchemyRuntimeContext: Alchemy.BaseRuntimeContext,
 ) =>
   layer.pipe(

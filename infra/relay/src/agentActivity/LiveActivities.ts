@@ -13,12 +13,12 @@ import * as Effect from "effect/Effect";
 import * as Function from "effect/Function";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, isNotNull, sql } from "drizzle-orm";
 
 import * as RelayDb from "../db.ts";
 import { relayLiveActivities, relayMobileDevices } from "../persistence/schema.ts";
 
-export class LiveActivityRegistrationPersistenceError extends Schema.TaggedErrorClass<LiveActivityRegistrationPersistenceError>()(
+export class LiveActivityRegistrationPersistenceError extends Schema.TaggedError<LiveActivityRegistrationPersistenceError>()(
   "LiveActivityRegistrationPersistenceError",
   {
     userId: Schema.String,
@@ -31,7 +31,7 @@ export class LiveActivityRegistrationPersistenceError extends Schema.TaggedError
   }
 }
 
-export class LiveActivityTargetListPersistenceError extends Schema.TaggedErrorClass<LiveActivityTargetListPersistenceError>()(
+export class LiveActivityTargetListPersistenceError extends Schema.TaggedError<LiveActivityTargetListPersistenceError>()(
   "LiveActivityTargetListPersistenceError",
   {
     userId: Schema.String,
@@ -43,7 +43,19 @@ export class LiveActivityTargetListPersistenceError extends Schema.TaggedErrorCl
   }
 }
 
-export class LiveActivityDeliveryMarkPersistenceError extends Schema.TaggedErrorClass<LiveActivityDeliveryMarkPersistenceError>()(
+export class LiveActivityIdleTargetListPersistenceError extends Schema.TaggedError<LiveActivityIdleTargetListPersistenceError>()(
+  "LiveActivityIdleTargetListPersistenceError",
+  {
+    deliveredBefore: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `Failed to list idle Live Activities delivered before ${this.deliveredBefore}.`;
+  }
+}
+
+export class LiveActivityDeliveryMarkPersistenceError extends Schema.TaggedError<LiveActivityDeliveryMarkPersistenceError>()(
   "LiveActivityDeliveryMarkPersistenceError",
   {
     operation: Schema.Literals([
@@ -66,8 +78,8 @@ export class LiveActivityDeliveryMarkPersistenceError extends Schema.TaggedError
 export interface DeviceRow {
   readonly user_id: string;
   readonly device_id: string;
-  readonly platform: "ios";
-  readonly ios_major_version: number;
+  readonly platform: "ios" | "android";
+  readonly ios_major_version: number | null;
   readonly app_version: string | null;
   readonly bundle_id: string | null;
   readonly aps_environment: "sandbox" | "production" | null;
@@ -97,6 +109,12 @@ export class LiveActivities extends Context.Service<
     readonly listTargets: (input: {
       readonly userId: string;
     }) => Effect.Effect<ReadonlyArray<TargetRow>, LiveActivityTargetListPersistenceError>;
+    readonly listIdleArmedTargets: (input: {
+      readonly deliveredBefore: string;
+    }) => Effect.Effect<
+      ReadonlyArray<{ readonly user_id: string; readonly device_id: string }>,
+      LiveActivityIdleTargetListPersistenceError
+    >;
     readonly markDelivery: (input: {
       readonly userId: string;
       readonly deviceId: string;
@@ -122,8 +140,8 @@ export class LiveActivities extends Context.Service<
   }
 >()("t3code-relay/agentActivity/LiveActivities") {}
 
-const decodeJsonString = Schema.decodeEffect(Schema.UnknownFromJsonString);
-const encodeJsonValue = Schema.encodeEffect(Schema.UnknownFromJsonString);
+const decodeJsonString = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
+const encodeJsonValue = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 const encodeRelayAgentActivityAggregateStateJson = Schema.encodeEffect(
   Schema.fromJsonString(RelayAgentActivityAggregateStateSchema),
@@ -140,6 +158,26 @@ export const make = Effect.gen(function* () {
       yield* Effect.gen(function* () {
         const updatedAt = DateTime.formatIso(yield* DateTime.now);
         const registration = input.registration;
+        const [current] = yield* db
+          .select({
+            activityPushToken: relayLiveActivities.activityPushToken,
+            remoteStartedAt: relayLiveActivities.remoteStartedAt,
+          })
+          .from(relayLiveActivities)
+          .where(
+            and(
+              eq(relayLiveActivities.userId, input.userId),
+              eq(relayLiveActivities.deviceId, registration.deviceId),
+            ),
+          );
+        // The app re-registers its current card's token on every foreground.
+        // Restamping the arming time would make that card look freshly armed,
+        // and the arming grace in ApnsDeliveries would swallow the end that
+        // the registration replay owes a card whose work is gone.
+        const armedAt =
+          (current?.activityPushToken === registration.activityPushToken
+            ? current.remoteStartedAt
+            : null) ?? updatedAt;
 
         yield* db
           .update(relayLiveActivities)
@@ -159,7 +197,7 @@ export const make = Effect.gen(function* () {
             deviceId: registration.deviceId,
             activityPushToken: registration.activityPushToken,
             remoteStartQueuedAt: null,
-            remoteStartedAt: updatedAt,
+            remoteStartedAt: armedAt,
             endedAt: null,
             lastAggregateJson: null,
             lastLiveActivityDeliveryAt: null,
@@ -171,7 +209,7 @@ export const make = Effect.gen(function* () {
             set: {
               activityPushToken: registration.activityPushToken,
               remoteStartQueuedAt: null,
-              remoteStartedAt: updatedAt,
+              remoteStartedAt: armedAt,
               endedAt: null,
               lastAggregateJson: null,
               lastLiveActivityDeliveryAt: null,
@@ -250,6 +288,32 @@ export const make = Effect.gen(function* () {
         );
     }),
 
+    listIdleArmedTargets: Effect.fn("relay.live_activities.list_idle_armed_targets")(
+      function* (input) {
+        return yield* db
+          .select({
+            user_id: relayLiveActivities.userId,
+            device_id: relayLiveActivities.deviceId,
+          })
+          .from(relayLiveActivities)
+          .where(
+            and(
+              isNotNull(relayLiveActivities.activityPushToken),
+              sql`coalesce(${relayLiveActivities.lastLiveActivityDeliveryAt}, ${relayLiveActivities.remoteStartedAt}, ${relayLiveActivities.updatedAt}) < ${input.deliveredBefore}`,
+            ),
+          )
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new LiveActivityIdleTargetListPersistenceError({
+                  deliveredBefore: input.deliveredBefore,
+                  cause,
+                }),
+            ),
+          );
+      },
+    ),
+
     markDelivery: Effect.fn("relay.live_activities.mark_delivery")(function* (input) {
       yield* Effect.annotateCurrentSpan({
         "relay.mobile.device_id": input.deviceId,
@@ -283,12 +347,7 @@ export const make = Effect.gen(function* () {
               // A delivered start begins a NEW activity generation: the stored
               // update token belongs to the previous activity (dead once a new
               // one starts, and certainly dead after an end), so keep it only
-              // for plain updates. Deliveries pause until the app registers
-              // the fresh activity's token; registerLiveActivity + replay then
-              // reconcile content (or end the activity if work already
-              // finished). Without this, updates and ends route to the dead
-              // token and the new lock-screen card is stranded at its start
-              // content forever.
+              // for plain updates.
               activityPushToken:
                 input.kind === "live_activity_update"
                   ? sql`${relayLiveActivities.activityPushToken}`

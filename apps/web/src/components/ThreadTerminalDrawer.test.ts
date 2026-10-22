@@ -1,75 +1,89 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
+import {
+  applyTerminalAttachStreamEvent,
+  combineTerminalSessionState,
+  EMPTY_TERMINAL_BUFFER_STATE,
+  INITIAL_TERMINAL_OUTPUT_CURSOR,
+  nextTerminalAttachSeedState,
+} from "@t3tools/client-runtime/state/terminal";
 
 import {
-  resolveTerminalSelectionActionPosition,
-  shouldHandleTerminalSelectionMouseUp,
-  terminalSelectionActionDelayForClickCount,
+  shouldClearTerminalSelectionAction,
+  shouldHandleTerminalExit,
+  synchronizeTerminalOutput,
 } from "./ThreadTerminalDrawer";
 
-describe("resolveTerminalSelectionActionPosition", () => {
-  it("prefers the selection rect over the last pointer position", () => {
+describe("terminal selection actions", () => {
+  it("does not let an old selection popup cancel its replacement right-click menu", () => {
     expect(
-      resolveTerminalSelectionActionPosition({
-        bounds: { left: 100, top: 50, width: 500, height: 220 },
-        selectionRect: { right: 260, bottom: 140 },
-        pointer: { x: 520, y: 200 },
-        viewport: { width: 1024, height: 768 },
+      shouldClearTerminalSelectionAction({
+        actionPending: false,
+        openMenuRequestId: 3,
+        currentRequestId: 4,
       }),
-    ).toEqual({
-      x: 260,
-      y: 144,
-    });
-  });
-
-  it("falls back to the pointer position when no selection rect is available", () => {
+    ).toBe(false);
     expect(
-      resolveTerminalSelectionActionPosition({
-        bounds: { left: 100, top: 50, width: 500, height: 220 },
-        selectionRect: null,
-        pointer: { x: 180, y: 130 },
-        viewport: { width: 1024, height: 768 },
+      shouldClearTerminalSelectionAction({
+        actionPending: false,
+        openMenuRequestId: null,
+        currentRequestId: 4,
       }),
-    ).toEqual({
-      x: 180,
-      y: 130,
-    });
+    ).toBe(false);
   });
 
-  it("clamps the pointer fallback into the terminal drawer bounds", () => {
-    expect(
-      resolveTerminalSelectionActionPosition({
-        bounds: { left: 100, top: 50, width: 500, height: 220 },
-        selectionRect: null,
-        pointer: { x: 720, y: 340 },
-        viewport: { width: 1024, height: 768 },
-      }),
-    ).toEqual({
-      x: 600,
-      y: 270,
-    });
-
-    expect(
-      resolveTerminalSelectionActionPosition({
-        bounds: { left: 100, top: 50, width: 500, height: 220 },
-        selectionRect: null,
-        pointer: { x: 40, y: 20 },
-        viewport: { width: 1024, height: 768 },
-      }),
-    ).toEqual({
-      x: 100,
-      y: 50,
-    });
+  it("handles an exit that lands while the terminal surface is still loading", () => {
+    expect(shouldHandleTerminalExit("exited", "running", false, 1)).toBe(true);
+    expect(shouldHandleTerminalExit("exited", "exited", false, 1)).toBe(false);
+    expect(shouldHandleTerminalExit("closed", "running", true, 1)).toBe(false);
   });
+});
 
-  it("delays multi-click selection actions so triple-click selection can complete", () => {
-    expect(terminalSelectionActionDelayForClickCount(1)).toBe(0);
-    expect(terminalSelectionActionDelayForClickCount(2)).toBe(260);
-    expect(terminalSelectionActionDelayForClickCount(3)).toBe(260);
+it("retains visible output and selection until a replacement subscription receives its snapshot", () => {
+  const terminal = { resetAndWrite: vi.fn(), write: vi.fn(), clearSelection: vi.fn() };
+  const snapshot = {
+    threadId: "thread",
+    terminalId: "term-1",
+    cwd: "/repo",
+    worktreePath: null,
+    status: "running" as const,
+    pid: 123,
+    history: "host output",
+    exitCode: null,
+    exitSignal: null,
+    label: "Terminal 1",
+    updatedAt: "2026-09-05T00:00:00.000Z",
+  };
+  const attached = applyTerminalAttachStreamEvent(nextTerminalAttachSeedState(), {
+    type: "snapshot",
+    snapshot,
   });
+  const cursor = synchronizeTerminalOutput(terminal, attached, INITIAL_TERMINAL_OUTPUT_CURSOR);
+  expect(terminal.resetAndWrite).toHaveBeenLastCalledWith("host output");
+  terminal.resetAndWrite.mockClear();
+  terminal.clearSelection.mockClear();
 
-  it("only handles mouseup when the selection gesture started in the terminal", () => {
-    expect(shouldHandleTerminalSelectionMouseUp(true, 0)).toBe(true);
-    expect(shouldHandleTerminalSelectionMouseUp(false, 0)).toBe(false);
-    expect(shouldHandleTerminalSelectionMouseUp(true, 1)).toBe(false);
+  const pending = combineTerminalSessionState(
+    { ...snapshot, hasRunningSubprocess: false },
+    EMPTY_TERMINAL_BUFFER_STATE,
+  );
+  expect(pending.status).toBe("running");
+  expect(synchronizeTerminalOutput(terminal, pending, cursor)).toBe(cursor);
+  expect(terminal.resetAndWrite).not.toHaveBeenCalled();
+  expect(terminal.write).not.toHaveBeenCalled();
+  expect(terminal.clearSelection).not.toHaveBeenCalled();
+
+  const observed = applyTerminalAttachStreamEvent(nextTerminalAttachSeedState(), {
+    type: "snapshot",
+    snapshot: { ...snapshot, history: "host output\nobserved output" },
   });
+  const observedCursor = synchronizeTerminalOutput(terminal, observed, cursor);
+  expect(terminal.resetAndWrite).toHaveBeenLastCalledWith("host output\nobserved output");
+
+  const cleared = applyTerminalAttachStreamEvent(observed, {
+    type: "cleared",
+    threadId: "thread",
+    terminalId: "term-1",
+  });
+  synchronizeTerminalOutput(terminal, cleared, observedCursor);
+  expect(terminal.resetAndWrite).toHaveBeenLastCalledWith("");
 });
